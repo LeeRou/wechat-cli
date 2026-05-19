@@ -45,44 +45,166 @@ def _choose_candidate(candidates):
     return None
 
 
+def _get_windows_documents():
+    """获取 Windows 实际的 Documents 文件夹路径 (处理重定向到 D 盘等情况)"""
+    # 方法1: 通过 Windows Registry 读取
+    import winreg
+    try:
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders"
+        )
+        value, _ = winreg.QueryValueEx(key, "Personal")
+        winreg.CloseKey(key)
+        # 展开 %USERPROFILE% 等环境变量
+        resolved = os.path.expandvars(value)
+        if os.path.isdir(resolved):
+            return resolved
+    except (OSError, ImportError):
+        pass
+
+    # 方法2: 通过 USERPROFILE
+    userprofile = os.environ.get("USERPROFILE", "")
+    docs = os.path.join(userprofile, "Documents")
+    if os.path.isdir(docs):
+        return docs
+
+    # 方法3: ~/Documents
+    return os.path.expanduser("~/Documents")
+
+
+def _resolve_windows_special_folder(name):
+    """将 Windows 特殊文件夹名（如 MyDocument:）解析为实际路径"""
+    name_lower = name.strip().lower().rstrip(":")
+    if name_lower in ("mydocument", "mydocuments", "personal"):
+        return _get_windows_documents()
+    if name_lower == "desktop":
+        return os.path.expanduser("~/Desktop")
+    if name_lower == "appdata":
+        return os.environ.get("APPDATA", "")
+    if name_lower == "localappdata":
+        return os.environ.get("LOCALAPPDATA", "")
+    return None
+
+
 def _auto_detect_db_dir_windows():
-    appdata = os.environ.get("APPDATA", "")
-    config_dir = os.path.join(appdata, "Tencent", "xwechat", "config")
-    if not os.path.isdir(config_dir):
-        return None
-    data_roots = []
-    for ini_file in glob_mod.glob(os.path.join(config_dir, "*.ini")):
-        try:
-            content = None
-            for enc in ("utf-8", "gbk"):
-                try:
-                    with open(ini_file, "r", encoding=enc) as f:
-                        content = f.read(1024).strip()
-                    break
-                except UnicodeDecodeError:
-                    continue
-            if not content or any(c in content for c in "\n\r\x00"):
-                continue
-            if os.path.isdir(content):
-                data_roots.append(content)
-        except OSError:
-            continue
+    """Windows 下自动检测微信数据目录 (支持 3.x 和 4.x)"""
     seen = set()
     candidates = []
-    for root in data_roots:
-        pattern = os.path.join(root, "xwechat_files", "*", "db_storage")
+    data_roots = []
+
+    # 1. 从 xwechat config .ini 读取数据根目录
+    appdata = os.environ.get("APPDATA", "")
+    config_dir = os.path.join(appdata, "Tencent", "xwechat", "config")
+    if os.path.isdir(config_dir):
+        for ini_file in glob_mod.glob(os.path.join(config_dir, "*.ini")):
+            try:
+                content = None
+                for enc in ("utf-8", "gbk", "ascii"):
+                    try:
+                        with open(ini_file, "r", encoding=enc) as f:
+                            content = f.read(1024).strip()
+                        break
+                    except UnicodeDecodeError:
+                        continue
+                if not content or any(c in content for c in "\n\r\x00"):
+                    continue
+                # 尝试直接作为路径
+                if os.path.isdir(content):
+                    data_roots.append(content)
+                    continue
+                # 尝试解析 Windows 特殊文件夹名
+                resolved = _resolve_windows_special_folder(content)
+                if resolved and os.path.isdir(resolved):
+                    data_roots.append(resolved)
+            except OSError:
+                continue
+
+    # 2. 搜索 xwechat_files (微信 4.x 新版)
+    search_roots = list(data_roots)  # 从 .ini 读到的路径
+    # 额外兜底路径
+    real_docs = _get_windows_documents()
+    userprofile = os.environ.get("USERPROFILE", "")
+    username = os.environ.get("USERNAME", "")
+    for base in [
+        real_docs,
+        os.path.expanduser("~/Desktop"),
+        os.path.join(userprofile, "Documents"),
+    ]:
+        if base and os.path.isdir(base) and base not in search_roots:
+            search_roots.append(base)
+    # 也搜其他盘上的同名用户目录（处理 Documents 重定向到 D:/E: 等情况）
+    for drive in ["D:", "E:", "F:"]:
+        alt_docs = os.path.join(drive + "\\", "Users", username, "Documents")
+        if os.path.isdir(alt_docs) and alt_docs not in search_roots:
+            search_roots.append(alt_docs)
+        # 也搜盘根下的一级目录
+        try:
+            entries = os.listdir(drive + "\\")
+            for entry in entries:
+                p = os.path.join(drive + "\\", entry)
+                if os.path.isdir(p) and p not in search_roots:
+                    search_roots.append(p)
+        except OSError:
+            continue
+
+    # 在所有根目录下搜 xwechat_files (新版)
+    for root in search_roots:
+        if not os.path.isdir(root):
+            continue
+        # 直接搜 xwechat_files
+        xwf_pattern = os.path.join(root, "xwechat_files", "*", "db_storage")
+        for match in glob_mod.glob(xwf_pattern):
+            normalized = os.path.normcase(os.path.normpath(match))
+            if os.path.isdir(match) and normalized not in seen:
+                seen.add(normalized)
+                candidates.append(match)
+
+    # 3. 搜索旧版微信目录 (3.x)
+    old_patterns = [
+        os.path.join(root, "WeChat Files", "*", "db_storage")
+        for root in search_roots if os.path.isdir(root)
+    ]
+    for pattern in old_patterns:
         for match in glob_mod.glob(pattern):
             normalized = os.path.normcase(os.path.normpath(match))
             if os.path.isdir(match) and normalized not in seen:
                 seen.add(normalized)
                 candidates.append(match)
+
+    # 4. 最后尝试旧版微信默认文档路径
+    legacy_doc = os.path.join(real_docs, "WeChat Files")
+    if os.path.isdir(legacy_doc):
+        for user_dir in os.listdir(legacy_doc):
+            db_storage = os.path.join(legacy_doc, user_dir, "db_storage")
+            normalized = os.path.normcase(os.path.normpath(db_storage))
+            if os.path.isdir(db_storage) and normalized not in seen:
+                seen.add(normalized)
+                candidates.append(db_storage)
+
+    # 5. 按最后修改时间排序（优先最新数据）
+    def _mtime(path):
+        msg_dir = os.path.join(path, "message")
+        target = msg_dir if os.path.isdir(msg_dir) else path
+        try:
+            return os.path.getmtime(target)
+        except OSError:
+            return 0
+    candidates.sort(key=_mtime, reverse=True)
+
     return _choose_candidate(candidates)
 
 
 def _auto_detect_db_dir_linux():
     seen = set()
     candidates = []
+    # xwechat_files (新版 4.x)
     search_roots = [os.path.expanduser("~/Documents/xwechat_files")]
+    # 旧版 WeChat Files
+    legacy = os.path.expanduser("~/Documents/WeChat Files")
+    if os.path.isdir(legacy):
+        search_roots.append(legacy)
+    # sudo 场景
     sudo_user = os.environ.get("SUDO_USER")
     if sudo_user:
         import pwd
@@ -91,23 +213,31 @@ def _auto_detect_db_dir_linux():
         except KeyError:
             sudo_home = None
         if sudo_home:
-            fallback = os.path.join(sudo_home, "Documents", "xwechat_files")
-            if fallback not in search_roots:
-                search_roots.append(fallback)
+            for sub in ("Documents/xwechat_files", "Documents/WeChat Files"):
+                fallback = os.path.join(sudo_home, sub)
+                if os.path.isdir(fallback) and fallback not in search_roots:
+                    search_roots.append(fallback)
+    # 旧版 wine 微信
+    wine_path = os.path.expanduser("~/.local/share/weixin/data/db_storage")
+    if os.path.isdir(wine_path):
+        normalized = os.path.normcase(os.path.normpath(wine_path))
+        if normalized not in seen:
+            seen.add(normalized)
+            candidates.append(wine_path)
+
     for root in search_roots:
         if not os.path.isdir(root):
             continue
-        pattern = os.path.join(root, "*", "db_storage")
+        # 直接在根下搜 db_storage 子目录 (xwechat_files/<user>/db_storage 结构)
+        if "xwechat_files" in root or "WeChat Files" in root:
+            pattern = os.path.join(root, "*", "db_storage")
+        else:
+            pattern = os.path.join(root, "db_storage")
         for match in glob_mod.glob(pattern):
             normalized = os.path.normcase(os.path.normpath(match))
             if os.path.isdir(match) and normalized not in seen:
                 seen.add(normalized)
                 candidates.append(match)
-    old_path = os.path.expanduser("~/.local/share/weixin/data/db_storage")
-    if os.path.isdir(old_path):
-        normalized = os.path.normcase(os.path.normpath(old_path))
-        if normalized not in seen:
-            candidates.append(old_path)
 
     def _mtime(path):
         msg_dir = os.path.join(path, "message")
@@ -121,17 +251,42 @@ def _auto_detect_db_dir_linux():
 
 
 def _auto_detect_db_dir_macos():
-    base = os.path.expanduser("~/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files")
-    if not os.path.isdir(base):
-        return None
+    """macOS 自动检测 (支持新版 4.x 和旧版 3.x)"""
     seen = set()
     candidates = []
-    pattern = os.path.join(base, "*", "db_storage")
-    for match in glob_mod.glob(pattern):
-        normalized = os.path.normcase(os.path.normpath(match))
-        if os.path.isdir(match) and normalized not in seen:
-            seen.add(normalized)
-            candidates.append(match)
+
+    # 新版微信 4.x: ~/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files/*/db_storage
+    new_base = os.path.expanduser(
+        "~/Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files"
+    )
+    search_roots = [new_base]
+
+    # 旧版微信 3.x: ~/Library/Containers/com.tencent.xinWeChat/Data/Library/Application Support/com.tencent.xinWeChat/.../Msg
+    legacy_base = os.path.expanduser(
+        "~/Library/Containers/com.tencent.xinWeChat/Data/Library/Application Support/com.tencent.xinWeChat"
+    )
+    if os.path.isdir(legacy_base):
+        search_roots.append(legacy_base)
+
+    for root in search_roots:
+        if not os.path.isdir(root):
+            continue
+        if "xwechat_files" in root:
+            pattern = os.path.join(root, "*", "db_storage")
+        else:
+            # 旧版路径可能不同，也尝试 db_storage 直搜
+            for sub in glob_mod.glob(os.path.join(root, "*", "*", "db_storage")):
+                normalized = os.path.normcase(os.path.normpath(sub))
+                if os.path.isdir(sub) and normalized not in seen:
+                    seen.add(normalized)
+                    candidates.append(sub)
+            pattern = os.path.join(root, "db_storage")
+        for match in glob_mod.glob(pattern):
+            normalized = os.path.normcase(os.path.normpath(match))
+            if os.path.isdir(match) and normalized not in seen:
+                seen.add(normalized)
+                candidates.append(match)
+
     return _choose_candidate(candidates)
 
 
